@@ -1,0 +1,4 @@
+# Keep the folder, ignore run artifacts
+*
+!.gitignore
+!.gitkeep

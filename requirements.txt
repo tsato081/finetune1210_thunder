@@ -1,0 +1,11 @@
+python>=3.11
+torch
+transformers
+pandas
+scikit-learn
+tqdm
+matplotlib
+japanize-matplotlib
+numpy
+python-dotenv
+huggingface-hub
