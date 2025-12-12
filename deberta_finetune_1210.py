@@ -4,7 +4,7 @@ from __future__ import annotations
 Stage2 multi-task fine-tuning for DeBERTa (Pick/Decline + 96-category).
 
 Design goals (per finetune_architecture.md):
-- Start from Stage1 encoder checkpoint (Pick large-scale pretrain)
+- Start from Stage1 encoder checkpoint (Pick large-scale pretrain; default local models/deberta_pick_pretrain_cuda)
 - Simple heads: mean pooling -> linear for Task1/Task2
 - Loss: plain CE with minimal regularization
   * Task1 label smoothing = 0.0 (sharp boundary)
@@ -26,7 +26,9 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+from torch.cuda.amp import autocast, GradScaler
+
 
 import numpy as np
 import pandas as pd
@@ -41,7 +43,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
 )
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 from transformers import (
     AutoConfig,
@@ -90,14 +92,16 @@ except ImportError:
 # -----------------------------------------------------------------------------
 @dataclass
 class Config:
-    model_name: str = "models/deberta_pick_pretrain_mps"  # Stage1 checkpoint (place under models/)
-    output_root: str = "output"
+    model_name: Union[str, Path] = Path(__file__).resolve().parent / "deberta_v3_mlm"  # default to local Stage1 checkpoint
+    base_dir: Path = Path(__file__).resolve().parent
+    
+    output_root: Path = base_dir / "output"
 
-    task1_csv: str = "data/train/task1_cleaned.csv"
-    task2_csv: str = "data/train/task2_cleaned.csv"
-    test_csv: str = "data/test/Hawks4.0正解データ.csv"
-    test_csv_v5: str = "data/test/Hawks ver 5.0 csv出力用.csv"
-    test2_csv: str = "data/test/Hawks_Revenge_test_2.csv"
+    task1_csv: Path = base_dir / "data/train/task1_cleaned_all.csv"
+    task2_csv: Path = base_dir / "data/train/task2_cleaned.csv"
+    test_csv: Path = base_dir / "data/test/Hawks4.0正解データ.csv"
+    test_csv_v5: Path = base_dir / "data/test/Hawks ver 5.0 csv出力用.csv"
+    test2_csv: Path = base_dir / "data/test/Hawks_Revenge_test_2.csv"
     val_size: float = 0.1
     max_length: int = 384
     seed: int = 42
@@ -107,13 +111,13 @@ class Config:
     lr_decay: float = 0.8  # LLRD decay per layer
     weight_decay: float = 0.01
     num_train_epochs: int = 10
-    early_stopping_patience: int = 3  # stop if no macro F1 improvement for this many epochs
+    early_stopping_patience: int = 1  # stop if no macro F1 improvement for this many epochs
     per_device_train_batch_size: int = 64
     per_device_eval_batch_size: int = 64
     gradient_accumulation_steps: int = 1
     warmup_ratio: float = 0.06
     max_grad_norm: float = 1.0
-    dataloader_num_workers: int = 2
+    dataloader_num_workers: int = 4
 
     # Loss balance
     lambda_task1: float = 0.4
@@ -121,7 +125,7 @@ class Config:
 
     hierarchy_weight: float = 0.1  # Decline時にTask2分布をフラット化する正則化係数
     rdrop_alpha_task1: float = 0.0  # 0〜0.3くらいで様子見
-    rdrop_alpha_task2: float = 0.5  # 0.5〜1.0推奨（Task2主体）
+    rdrop_alpha_task2: float = 0.7  # 0.5〜1.0推奨（Task2主体）
 
     # Loss details
     label_smoothing_task1: float = 0.0
@@ -135,7 +139,8 @@ class Config:
 
     pick_map: Dict[str, int] = None
     pick_map_rev: Dict[int, str] = None
-
+    use_amp: bool = True  
+    torch_compile: bool = False 
 
 CFG = Config(
     pick_map={"Pick": 1, "Decline": 0},
@@ -152,15 +157,20 @@ def setup_device_and_seed(cfg: Config) -> torch.device:
         device = torch.device("mps")
         logger.info("Using MPS.")
         torch.mps.manual_seed(cfg.seed)  # type: ignore[attr-defined]
+        cfg.use_amp = False  # このスクリプトでは MPS で AMP は使わない
     elif torch.cuda.is_available():
         device = torch.device("cuda")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True  # 入力サイズが固定なので ON で OK
         logger.info("Using CUDA.")
+        cfg.use_amp = bool(cfg.use_amp)       # CUDA のときだけ AMP
     else:
         device = torch.device("cpu")
         logger.info("Using CPU.")
+        cfg.use_amp = False                   # CPU では AMP 無効
     return device
+
 
 
 def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -394,12 +404,15 @@ def build_optimizer(model: nn.Module, cfg: Config):
         group_lr = lr_for(name)
         wd = 0.0 if any(nd in name for nd in no_decay) else cfg.weight_decay
         params.append({"params": [param], "lr": group_lr, "weight_decay": wd})
-
-    optimizer = torch.optim.AdamW(params)
+    fused = torch.cuda.is_available()
+    try:
+        optimizer = torch.optim.AdamW(params, fused=fused)
+    except TypeError:
+        optimizer = torch.optim.AdamW(params)
     return optimizer
 
 
-def evaluate(model, dataloader, device, ce_t1, ce_t2, lambda1, lambda2, hierarchy_weight: float):
+def evaluate(model, dataloader, device, ce_t1, ce_t2, lambda1, lambda2, hierarchy_weight: float, use_amp: bool = False):
     model.eval()
     all_labels_t1, all_preds_t1 = [], []
     all_labels_t2, all_preds_t2 = [], []
@@ -407,23 +420,25 @@ def evaluate(model, dataloader, device, ce_t1, ce_t2, lambda1, lambda2, hierarch
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Eval", leave=False):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels_binary = batch["labels_binary"].to(device)
-            labels_category = batch["labels_category"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels_binary = batch["labels_binary"].to(device, non_blocking=True)
+            labels_category = batch["labels_category"].to(device, non_blocking=True)
 
-            logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
-            total_loss, l1, l2, hier = compute_losses(
-                logits_t1,
-                logits_t2,
-                labels_binary,
-                labels_category,
-                ce_t1,
-                ce_t2,
-                lambda1,
-                lambda2,
-                hierarchy_weight,
-            )
+            with autocast(enabled=use_amp):
+                logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
+                total_loss, l1, l2, hier = compute_losses(
+                    logits_t1,
+                    logits_t2,
+                    labels_binary,
+                    labels_category,
+                    ce_t1,
+                    ce_t2,
+                    lambda1,
+                    lambda2,
+                    hierarchy_weight,
+                )
+
             losses_total.append(total_loss.item())
             losses_hier.append(hier.item())
             if labels_binary.ne(-100).any():
@@ -466,18 +481,19 @@ def evaluate(model, dataloader, device, ce_t1, ce_t2, lambda1, lambda2, hierarch
         )
     metrics["total_loss"] = float(np.mean(losses_total)) if losses_total else 0.0
     metrics["hier_loss"] = float(np.mean(losses_hier)) if losses_hier else 0.0
+
     return metrics, all_labels_t2, all_preds_t2
 
-
-def compute_hierarchy_stats(model, dataloader, device, pick_low_thresh: float = 0.4, decline_high_thresh: float = 0.6):
+def compute_hierarchy_stats(model, dataloader, device, pick_low_thresh: float = 0.4, decline_high_thresh: float = 0.6, use_amp: bool = False):
     model.eval()
     pick_low, pick_total = 0, 0
     decline_high, decline_total = 0, 0
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Hierarchy", leave=False):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
             prob_t1 = F.softmax(logits_t1, dim=-1)  # [:,1] is Pick
             prob_t2 = F.softmax(logits_t2, dim=-1)
 
@@ -572,15 +588,16 @@ def symmetric_kl(logits_p, logits_q):
     return 0.5 * (kl_pq + kl_qp)
 
 
-def collect_task1_probs(model, dataloader, device):
+def collect_task1_probs(model, dataloader, device, use_amp: bool = False):
     model.eval()
     probs, labels = [], []
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Collect Task1 probs", leave=False):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels_b = batch["labels_binary"].to(device)
-            logits_t1, _ = model(input_ids=input_ids, attention_mask=attention_mask)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels_b = batch["labels_binary"].to(device, non_blocking=True)
+            with autocast(enabled=use_amp):
+                logits_t1, _ = model(input_ids=input_ids, attention_mask=attention_mask)
             prob_b = torch.softmax(logits_t1, dim=-1)[:, 1]
             mask_b = labels_b != -100
             if mask_b.any():
@@ -620,7 +637,29 @@ def main():
     logger.info("Logging to %s", log_path)
 
     device = setup_device_and_seed(CFG)
-    tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
+
+    model_name = CFG.model_name
+    resolved_local = None
+    if isinstance(model_name, (str, Path)):
+        candidates = []
+        p = Path(model_name).expanduser()
+        candidates.append(p)
+        if not p.is_absolute():
+            candidates.append((CFG.base_dir / p).expanduser())
+        resolved_local = next((c for c in candidates if c.exists()), None)
+
+    if resolved_local:
+        model_name = resolved_local
+        logger.info("Loading model from local path: %s", model_name)
+    elif isinstance(CFG.model_name, Path):
+        raise FileNotFoundError(
+            f"Local model path not found: {Path(CFG.model_name).resolve()} (set CFG.model_name to an HF repo id if you want to fetch from hub)"
+        )
+    else:
+        model_name = str(model_name)
+        logger.info("Loading model from hub repo id: %s", model_name)
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     if not os.path.exists(CFG.task1_csv) or not os.path.exists(CFG.task2_csv):
         raise FileNotFoundError("Task CSV not found.")
@@ -652,23 +691,54 @@ def main():
     train_ds = MultiTaskDataset(df_train, tokenizer, CFG.max_length, label2id)
     val_ds = MultiTaskDataset(df_val, tokenizer, CFG.max_length, label2id)
 
+    pin_memory = device.type == "cuda"
+    persistent_workers = CFG.dataloader_num_workers > 0
+
     collator = DataCollatorWithPadding(tokenizer=tokenizer, padding="max_length", max_length=CFG.max_length)
+    cat_series = df_train.get("category", pd.Series([""] * len(df_train))).astype(str).str.strip()
+    mask_t2 = cat_series.notna() & (cat_series != "") & (cat_series != "-1") & cat_series.isin(label2id)
+    cat_ids = cat_series.map(label2id)  # NaN含む
+
+    # Task1 (=category無し) は等確率。Task2だけ rare を多めに引く
+    weights_np = np.ones(len(df_train), dtype=np.float32)
+    if mask_t2.any():
+        counts = cat_ids[mask_t2].astype(int).value_counts()
+        inv = (1.0 / counts).to_dict()  # {class_id: inv_freq}
+        weights_np[mask_t2.values] = (
+            cat_ids[mask_t2].astype(int).map(inv).astype(np.float32).values
+        )
+        # Task2 の平均重みを 1 に正規化（t1:t2比率を極端に崩さない）
+        weights_np[mask_t2.values] /= weights_np[mask_t2.values].mean()
+
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(weights_np, dtype=torch.double),
+        num_samples=len(train_ds),  # 1 epoch あたりのサンプル数（元と同じ）
+        replacement=True,           # バランス取りのため必須
+        generator=torch.Generator().manual_seed(CFG.seed),
+    )
+
     train_loader = DataLoader(
         train_ds,
         batch_size=CFG.per_device_train_batch_size,
-        shuffle=True,
+        shuffle=False,              # sampler使用時はFalse
+        sampler=sampler,
         num_workers=CFG.dataloader_num_workers,
         collate_fn=collator,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
+
     val_loader = DataLoader(
         val_ds,
         batch_size=CFG.per_device_eval_batch_size,
         shuffle=False,
         num_workers=CFG.dataloader_num_workers,
         collate_fn=collator,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
     )
 
-    model = DebertaMultiTask(CFG.model_name, label2id, pooling=CFG.pooling).to(device)
+    model = DebertaMultiTask(model_name, label2id, pooling=CFG.pooling).to(device)
 
     # Losses
     if CFG.pick_class_weights is not None:
@@ -699,6 +769,8 @@ def main():
     num_warmup = int(num_training_steps * CFG.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup, num_training_steps)
 
+    scaler = GradScaler(enabled=CFG.use_amp)
+
     best_macro_f1 = -1.0
     best_path = None
     best_state = None
@@ -715,38 +787,50 @@ def main():
         for step, batch in enumerate(
             tqdm(train_loader, desc=f"Train Epoch {epoch+1}/{CFG.num_train_epochs}", leave=False)
         ):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels_binary = batch["labels_binary"].to(device)
-            labels_category = batch["labels_category"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels_binary = batch["labels_binary"].to(device, non_blocking=True)
+            labels_category = batch["labels_category"].to(device, non_blocking=True)
 
             # forward passes for R-Drop (second pass only if alpha > 0)
-            logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits_t1_b = logits_t2_b = None
-            if CFG.rdrop_alpha_task1 > 0 or CFG.rdrop_alpha_task2 > 0:
-                logits_t1_b, logits_t2_b = model(input_ids=input_ids, attention_mask=attention_mask)
+            with autocast(enabled=CFG.use_amp):
+                logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits_t1_b = logits_t2_b = None
+                if CFG.rdrop_alpha_task1 > 0 or CFG.rdrop_alpha_task2 > 0:
+                    logits_t1_b, logits_t2_b = model(input_ids=input_ids, attention_mask=attention_mask)
 
-            loss, l1, l2, hier = compute_losses(
-                logits_t1,
-                logits_t2,
-                labels_binary,
-                labels_category,
-                ce_t1,
-                ce_t2,
-                CFG.lambda_task1,
-                CFG.lambda_task2,
-                CFG.hierarchy_weight,
-                logits_task1_b=logits_t1_b,
-                logits_task2_b=logits_t2_b,
-                alpha_t1=CFG.rdrop_alpha_task1,
-                alpha_t2=CFG.rdrop_alpha_task2,
-            )
+                loss, l1, l2, hier = compute_losses(
+                    logits_t1,
+                    logits_t2,
+                    labels_binary,
+                    labels_category,
+                    ce_t1,
+                    ce_t2,
+                    CFG.lambda_task1,
+                    CFG.lambda_task2,
+                    CFG.hierarchy_weight,
+                    logits_task1_b=logits_t1_b,
+                    logits_task2_b=logits_t2_b,
+                    alpha_t1=CFG.rdrop_alpha_task1,
+                    alpha_t2=CFG.rdrop_alpha_task2,
+                )
+
             loss = loss / CFG.gradient_accumulation_steps
-            loss.backward()
+
+            if CFG.use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
             if (step + 1) % CFG.gradient_accumulation_steps == 0:
-                nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
-                optimizer.step()
+                if CFG.use_amp:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    nn.utils.clip_grad_norm_(model.parameters(), CFG.max_grad_norm)
+                    optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
@@ -773,7 +857,15 @@ def main():
         train_hier = float(np.mean(running_hier)) if running_hier else 0.0
 
         val_metrics, val_labels_t2, val_preds_t2 = evaluate(
-            model, val_loader, device, ce_t1, ce_t2, CFG.lambda_task1, CFG.lambda_task2, CFG.hierarchy_weight
+            model,
+            val_loader,
+            device,
+            ce_t1,
+            ce_t2,
+            CFG.lambda_task1,
+            CFG.lambda_task2,
+            CFG.hierarchy_weight,
+            CFG.use_amp,
         )
 
         # Train-side metrics for logging
@@ -858,14 +950,15 @@ def main():
 
     # Validation detailed stats with best model
     val_metrics, val_labels_t2_best, val_preds_t2_best = evaluate(
-        model, val_loader, device, ce_t1, ce_t2, CFG.lambda_task1, CFG.lambda_task2, CFG.hierarchy_weight
+    model, val_loader, device, ce_t1, ce_t2, CFG.lambda_task1, CFG.lambda_task2, CFG.hierarchy_weight, CFG.use_amp
     )
+
     logger.info("Best epoch val metrics: %s", {k: round(v, 4) for k, v in val_metrics.items()})
 
     # Task1 threshold search on val
     best_t1_threshold = 0.5
     best_t1_threshold_acc = 0.5
-    probs_val, labels_val = collect_task1_probs(model, val_loader, device)
+    probs_val, labels_val = collect_task1_probs(model, val_loader, device, CFG.use_amp)
     if labels_val:
         best_f1_th, best_acc_th = grid_search_threshold(probs_val, labels_val)
         best_t1_threshold = best_f1_th["threshold"]
@@ -902,7 +995,7 @@ def main():
             json.dump(report_dict, f, ensure_ascii=False, indent=2)
         logger.info("Saved val per-class metrics to %s", run_dir / "val_per_class_metrics.json")
 
-    hier_stats = compute_hierarchy_stats(model, val_loader, device)
+    hier_stats = compute_hierarchy_stats(model, val_loader, device, use_amp=CFG.use_amp)
     with open(run_dir / "hierarchy_stats_val.json", "w") as f:
         json.dump(hier_stats, f, ensure_ascii=False, indent=2)
     logger.info("Hierarchy stats (val): %s", {k: round(v, 4) if isinstance(v, float) else v for k, v in hier_stats.items()})
@@ -920,6 +1013,8 @@ def main():
             shuffle=False,
             num_workers=CFG.dataloader_num_workers,
             collate_fn=collator,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
 
         model.eval()
@@ -929,12 +1024,14 @@ def main():
         topk_total = 0
         with torch.no_grad():
             for batch in tqdm(test_loader, desc=f"Test-{name}"):
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                labels_b = batch["labels_binary"].to(device)
-                labels_c = batch["labels_category"].to(device)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                labels_b = batch["labels_binary"].to(device, non_blocking=True)
+                labels_c = batch["labels_category"].to(device, non_blocking=True)
 
-                logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
+                with autocast(enabled=CFG.use_amp):
+                    logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
+
                 prob_b = torch.softmax(logits_t1, dim=-1)[:, 1]
                 pred_b = (prob_b >= threshold).long()
                 pred_pick_all.extend(pred_b.cpu().tolist())
@@ -1024,15 +1121,18 @@ def main():
             shuffle=False,
             num_workers=CFG.dataloader_num_workers,
             collate_fn=collator,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
 
         model.eval()
         pred_pick_all2, pred_cat_all2 = [], []
         with torch.no_grad():
             for batch in tqdm(test2_loader, desc="Test2"):
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
+                input_ids = batch["input_ids"].to(device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+                with autocast(enabled=CFG.use_amp):
+                    logits_t1, logits_t2 = model(input_ids=input_ids, attention_mask=attention_mask)
                 prob_b = torch.softmax(logits_t1, dim=-1)[:, 1]
                 pred_b = (prob_b >= best_t1_threshold).long()
                 pred_pick_all2.extend(pred_b.cpu().tolist())

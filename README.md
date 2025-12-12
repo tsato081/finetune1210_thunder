@@ -19,7 +19,7 @@ Minimal, self-contained version of the Stage2 pipeline (Stage1 encoder already�
   - テスト（任意）: `data/test/Hawks4.0正解データ.csv`, `Hawks ver 5.0 csv出力用.csv`, `Hawks_Revenge_test_2.csv`
 - Hugging Face 経由でデータ取得する場合：
   - `.env.example` をコピーして `.env` を作成し、`HF_TOKEN` のみセット（デフォルトで data/train・data/test 配下に配置）
-  - `uv run bert_thunder/finetune1210_thunder/fetch_assets.py`
+  - `uv run ffinetune1210_thunder/fetch_assets.py`
 - Hugging Face にデータをアップする場合：
   - `.env` に `HF_AUTH_TOKEN`（必要なら `HF_DATASET_REPO`）を設定
   - `uv run bert_thunder/finetune1210_thunder/upload_to_hf.py`（data/train・data/test 内のCSVのみアップ、空コミットなし）
